@@ -90,6 +90,26 @@ from .utils import (
     new_sliding_window_spec,
 )
 
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_kv_trace_configuration_reaches_native_pool(caplog_vllm, enabled):
+    scheduler = create_scheduler(
+        model="vllm-project/tiny-random-LlamaForCausalLM",
+        additional_config={"kv_trace": {"enabled": enabled}},
+    )
+    request = create_requests(num_requests=1, num_tokens=32)[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[request.request_id] == 32
+    assert (scheduler.kv_trace is not None) == enabled
+    text = caplog_vllm.text
+    assert ("KV_TRACE KVTraceBatch(" in text) == enabled
+    if enabled:
+        for block_id in output.scheduled_new_reqs[0].block_ids[0]:
+            assert f"block_id={block_id}, generation=1" in text
+    scheduler.shutdown()
+
+
 pytestmark = pytest.mark.cpu_test
 
 

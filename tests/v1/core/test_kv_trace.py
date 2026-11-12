@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
+
 import pytest
 
 from vllm.v1.kv_trace import BlockAllocated, KVTrace, create_kv_trace
@@ -105,3 +107,82 @@ def test_retained_events_do_not_borrow_mutable_inputs():
 def test_retention_requires_a_positive_integer_capacity(max_events):
     with pytest.raises(ValueError, match="must be a positive integer"):
         KVTrace(max_events=max_events)
+
+
+def test_native_allocations_are_recorded_after_reference_updates():
+    from vllm.v1.core.block_pool import BlockPool
+
+    trace = KVTrace()
+    pool = BlockPool(3, enable_caching=True, hash_block_size=16)
+    pool.set_kv_trace(trace)
+    blocks = pool.get_new_blocks(2)
+    first = trace.take_events()
+    assert [event.block_id for event in first.events] == [b.block_id for b in blocks]
+    assert all(block.ref_cnt == 1 for block in blocks)
+    assert all(event.generation == 1 for event in first.events)
+
+    pool.touch(blocks)
+    pool.free_blocks(blocks)
+    assert trace.take_events().events == ()
+    assert all(block.ref_cnt == 1 for block in blocks)
+
+    pool.free_blocks(blocks)
+    reused = pool.get_new_blocks(2)
+    second = trace.take_events()
+    assert [event.block_id for event in second.events] == [b.block_id for b in reused]
+    assert {event.pool_id for event in second.events} == {
+        event.pool_id for event in first.events
+    }
+    assert all(event.generation == 2 for event in second.events)
+
+
+def test_failed_native_allocation_does_not_emit_an_event():
+    from vllm.v1.core.block_pool import BlockPool
+
+    trace = KVTrace()
+    pool = BlockPool(2, enable_caching=False, hash_block_size=16)
+    pool.set_kv_trace(trace)
+    with pytest.raises(ValueError, match="Cannot get"):
+        pool.get_new_blocks(2)
+    assert trace.take_events().events == ()
+
+
+def test_two_native_pools_do_not_share_allocation_generations():
+    from vllm.v1.core.block_pool import BlockPool
+
+    trace = KVTrace()
+    pools = [BlockPool(2, enable_caching=False, hash_block_size=16) for _ in range(2)]
+    for pool in pools:
+        pool.set_kv_trace(trace)
+        pool.get_new_blocks(1)
+    batch = trace.take_events()
+    assert len(batch.events) == 2
+    assert batch.events[0].block_id == batch.events[1].block_id
+    assert batch.events[0].pool_id != batch.events[1].pool_id
+    assert all(event.generation == 1 for event in batch.events)
+
+
+def test_native_allocation_reaches_the_log_consumer_once(caplog):
+    from vllm.v1.core.block_pool import BlockPool
+
+    trace = create_kv_trace({"kv_trace": {"enabled": True}})
+    assert trace is not None
+    pool = BlockPool(2, enable_caching=False, hash_block_size=16)
+    pool.set_kv_trace(trace)
+    blocks = pool.get_new_blocks(1)
+    logger = logging.getLogger("vllm.v1.kv_trace")
+    previous_propagation = logger.propagate
+    logger.propagate = False
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=logger.name):
+            trace.log_events()
+            trace.log_events()
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.propagate = previous_propagation
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 1
+    assert "KV_TRACE KVTraceBatch(" in messages[0]
+    assert f"trace_id='{trace.trace_id}'" in messages[0]
+    assert f"block_id={blocks[0].block_id}, generation=1" in messages[0]

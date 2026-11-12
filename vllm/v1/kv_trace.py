@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Engine-local KV trace collection, independent of runtime integration."""
+"""Engine-local collection and logging of native KV allocation events."""
 
 from collections import deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from uuid import uuid4
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,7 +36,7 @@ class KVTrace:
 
     Call `record_allocation` only after the native allocator hands blocks out
     for a new lifetime. Prefix sharing and reference release do not allocate.
-    Runtime callers and additional event types are introduced separately.
+    Reference and execution-plan events are introduced separately.
     """
 
     def __init__(self, max_events: int = 4096) -> None:
@@ -76,6 +80,12 @@ class KVTrace:
         self._events.clear()
         self._dropped_events = 0
         return batch
+
+    def log_events(self) -> None:
+        """Drain pending events to the engine's existing log output."""
+        batch = self.take_events()
+        if batch.events or batch.dropped_sequences is not None:
+            logger.info("KV_TRACE %s", batch)
 
 
 def create_kv_trace(additional_config: Mapping[str, object]) -> KVTrace | None:
