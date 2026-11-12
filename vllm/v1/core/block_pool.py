@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import weakref
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -31,6 +32,9 @@ from vllm.v1.core.kv_cache_utils import (
     to_event_extra_keys,
 )
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_trace import KVTrace
 
 logger = init_logger(__name__)
 
@@ -171,6 +175,15 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        self._kv_trace: KVTrace | None = None
+        self._kv_trace_pool_id = ""
+
+    def set_kv_trace(self, trace: "KVTrace") -> None:
+        """Attach tracing during scheduler initialization, before allocations."""
+        if self._kv_trace is not None:
+            raise ValueError("KV Trace is already attached to this block pool")
+        self._kv_trace = trace
+        self._kv_trace_pool_id = uuid4().hex
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -719,6 +732,10 @@ class BlockPool:
                 block.ref_cnt = 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        if self._kv_trace is not None:
+            self._kv_trace.record_allocation(
+                self._kv_trace_pool_id, (block.block_id for block in ret)
+            )
         return ret
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
